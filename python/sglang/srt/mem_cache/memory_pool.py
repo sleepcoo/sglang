@@ -27,7 +27,7 @@ from typing import List, Tuple, Union
 import torch
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    destindex_copy_quantize_kv,
+    quantize_cache_kv,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_compiler_backend
@@ -225,7 +225,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         ]
         self.k_scales_zeros = [
             torch.empty(
-                (self.size + 1, 2),
+                (self.size + 1, self.head_num, 2),
                 dtype=torch.float16,
                 device=self.device,
             )
@@ -233,7 +233,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         ]
         self.v_scales_zeros = [
             torch.empty(
-                (self.size + 1, 2),
+                (self.size + 1, self.head_num, 2),
                 dtype=torch.float16,
                 device=self.device,
             )
@@ -269,7 +269,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         else:
             return None
 
-    def get_kv_scales_buffer(self, layer_id: int):
+    def get_kv_scales_zeros_buffer(self, layer_id: int):
         if self.cache_type == torch.int8:
             return self.get_key_scales_zeros_buffer(
                 layer_id
@@ -288,8 +288,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
         # For handling fp8 situations, When float8_e5m2 is enabled, cache_k.dtype is fp16, self.cache_type is float8_e5m2, and store_dtype is uint8.
         if self.cache_type == torch.int8:
-            # TODO quant kernel
-            pass
+            quantize_cache_kv(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[layer_id],
+                self.k_scales_zeros[layer_id],
+                self.v_buffer[layer_id],
+                self.v_scales_zeros[layer_id]
+            )
         elif self.cache_type == torch.float8_e5m2:
             cache_k = cache_k.to(self.cache_type)
             cache_v = cache_v.to(self.cache_type)
