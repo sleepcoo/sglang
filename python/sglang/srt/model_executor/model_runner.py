@@ -476,11 +476,11 @@ class ModelRunner:
             )
         elif self.kv_cache_dtype == "int8":
             cell_size = (
-                self.model_config.get_num_kv_heads(self.tp_size) 
-                * (self.model_config.head_dim + 1) # scale
-                * self.model_config.num_hidden_layers 
-                * 2 
-                * torch._utils._element_size(self.kv_cache_dtype) 
+                self.model_config.get_num_kv_heads(self.tp_size)
+                * (self.model_config.head_dim + 1)  # scale
+                * self.model_config.num_hidden_layers
+                * 2
+                * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
             cell_size = (
@@ -516,7 +516,7 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens = 10  # self.profile_max_num_token(total_gpu_memory)
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
