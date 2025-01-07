@@ -293,17 +293,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 self.v_buffer[layer_id],
                 self.v_scales_zeros[layer_id],
             )
-            torch.set_printoptions(threshold=torch.inf)
-            torch.cuda.synchronize()
-            print(
-                "ffffsadasdsa\n",
-                cache_k,
-                "**************\n",
-                self.k_buffer,
-                "**************\n",
-                self.k_scales_zeros,
-                "dsadasdsa\n",
-            )
         elif self.kv_cache_dtype == torch.float8_e5m2:
             cache_k = cache_k.to(self.kv_cache_dtype)
             cache_v = cache_v.to(self.kv_cache_dtype)
