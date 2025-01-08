@@ -106,7 +106,7 @@ class BaseTokenToKVPool:
     ):
         self.size = size
         self.kv_cache_dtype = kv_cache_dtype
-        if kv_cache_dtype == torch.float8_e5m2:
+        if kv_cache_dtype == torch.float8_e5m2 or kv_cache_dtype == torch.int8:
             # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
