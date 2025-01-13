@@ -106,7 +106,6 @@ class BaseTokenToKVPool:
     ):
         self.size = size
         self.kv_cache_dtype = kv_cache_dtype
-        print(kv_cache_dtype)
         if kv_cache_dtype == torch.float8_e5m2 or kv_cache_dtype == torch.int8:
             # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -204,7 +203,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def _create_buffers(self):
         # [size, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        print(self.store_dtype)
         self.k_buffer = [
             torch.empty(
                 (self.size + 1, self.head_num, self.head_dim),
@@ -243,12 +241,18 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         del self.v_buffer
 
     def get_key_buffer(self, layer_id: int):
-        if self.kv_cache_dtype == torch.float8_e5m2 and self.store_dtype != self.kv_cache_dtype:
+        if (
+            self.kv_cache_dtype == torch.float8_e5m2
+            and self.store_dtype != self.kv_cache_dtype
+        ):
             return self.k_buffer[layer_id].view(self.kv_cache_dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
-        if self.kv_cache_dtype == torch.float8_e5m2 and self.store_dtype != self.kv_cache_dtype:
+        if (
+            self.kv_cache_dtype == torch.float8_e5m2
+            and self.store_dtype != self.kv_cache_dtype
+        ):
             return self.v_buffer[layer_id].view(self.kv_cache_dtype)
         return self.v_buffer[layer_id]
 

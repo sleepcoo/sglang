@@ -412,8 +412,8 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk = tl.dot(q, k.to(q.dtype))
-                # qk = tl.dot(q, (((k - 0.01)*1).to(q.dtype)))
+                # qk = tl.dot(q, k.to(q.dtype))
+                qk = tl.dot(q, (((k - 0.01) * 1).to(q.dtype)))
             else:
                 k_int8 = tl.load(
                     K_Buffer + offs_buf_k,
@@ -436,6 +436,7 @@ def _fwd_grouped_kernel_stage1(
                     other=0,
                 )
                 qk = tl.dot(q, (((k_int8 - k_zeros) * k_scales).to(q.dtype)))
+
                 #'''
                 # qk = tl.dot(q, (((k_int8 - 1)*1).to(q.dtype)))
 
@@ -479,7 +480,6 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                 )
                 acc += tl.dot(p.to(v.dtype), v)
-                # acc += tl.dot(p.to(v.dtype),((v -  0.0001) * 1).to(scale_dtype))
             else:
                 v_int8 = tl.load(
                     V_Buffer + offs_buf_v,
@@ -505,8 +505,6 @@ def _fwd_grouped_kernel_stage1(
                 acc += tl.dot(
                     p.to(scale_dtype), ((v_int8 - v_zeros) * v_scales).to(scale_dtype)
                 )
-                #'''
-                # acc += tl.dot(p.to(scale_dtype),((v_int8 -  1) * 1).to(scale_dtype))
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
