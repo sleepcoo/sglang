@@ -133,7 +133,7 @@ def _fwd_kernel_stage1(
                 )
                 # load k scale
                 offs_scale_k = (
-                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_buf_kh
+                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 )
                 k_scales = tl.load(
                     K_Scale_Zeros_Buffer + offs_scale_k,
@@ -147,7 +147,7 @@ def _fwd_kernel_stage1(
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                k = (k_int8 - k_zeros).to(scale_dtype) * k_scales
+                k = ((k_int8 - k_zeros) * k_scales).to(scale_dtype)
 
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
@@ -176,20 +176,20 @@ def _fwd_kernel_stage1(
                 )
                 # load v scale
                 offs_scale_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_buf_vh
+                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 )
                 v_scales = tl.load(
                     V_Scale_Zeros_Buffer + offs_scale_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=1.0,
                 )
-                offs_zeros_v = offs_scale_v
+                offs_zeros_v = offs_scale_v + 1
                 v_zeros = tl.load(
                     V_Scale_Zeros_Buffer + offs_zeros_v,
                     mask=offs_n[:, None] < split_kv_end,
                     other=0,
                 )
-                v = (v_int8 - v_zeros).to(scale_dtype) * v_scales
+                v = ((v_int8 - v_zeros) * v_scales).to(scale_dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -246,7 +246,6 @@ def _decode_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # assert kv dtype
-    # print(k_buffer.dtype)
     USE_INT8_KV = k_buffer[0].dtype == torch.uint8
 
     batch, head_num = B_req_idx.shape[0], q.shape[1]
