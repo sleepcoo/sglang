@@ -407,6 +407,7 @@ def grouped_gemm_triton(
     }
 
     config_dtype = get_config_dtype_str(
+        dtype=b.dtype,
         use_fp8_w8a8=use_fp8_w8a8,
     )
 
