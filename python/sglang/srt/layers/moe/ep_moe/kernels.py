@@ -220,6 +220,7 @@ def compute_m_range(
     return m_range_start, m_range_end, expert_id
 
 
+@triton.jit
 def grouped_gemm_triton_kernel(
     a,
     b,
@@ -423,13 +424,20 @@ def grouped_gemm_triton(
         is_w13=is_w13,
     )
     config = get_config_func(M)
-
+    del config["GROUP_SIZE_M"]
+    del config["num_warps"]
+    del config["num_stages"]
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
 
-    grouped_gemm_triton_kernel(
+    grid = lambda META: (
+        triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
+        triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
+    )
+
+    grouped_gemm_triton_kernel[grid](
         a,
         b,
         c,
