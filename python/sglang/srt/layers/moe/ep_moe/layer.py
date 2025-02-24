@@ -63,6 +63,7 @@ class GroupedGemmRunner(torch.nn.Module):
         scale_a: torch.Tensor = None,
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
+        is_w13: Optional[bool] = True,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -90,6 +91,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 scale_a,
                 scale_b,
                 block_shape=block_shape,
+                is_w13=is_w13,
             )
         return c
 
@@ -322,6 +324,7 @@ class EPMoE(torch.nn.Module):
                 else self.w2_weight_scale
             ),
             block_shape=self.block_shape,
+            is_w13=False,
         )
 
         # PostReorder

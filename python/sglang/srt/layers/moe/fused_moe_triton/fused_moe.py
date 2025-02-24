@@ -572,6 +572,7 @@ def get_moe_configs(
     dtype: Optional[str],
     block_n: Optional[int] = 0,
     block_k: Optional[int] = 0,
+    file_path: Optional[str] = "",
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -586,8 +587,10 @@ def get_moe_configs(
     # directory
     json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
 
+    if file_path == "":
+        file_path = __file__
     config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+        os.path.dirname(os.path.realpath(file_path)), "configs", json_file_name
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -672,6 +675,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    file_path: Optional[str] = "",
 ):
     from sglang.srt.layers.moe.fused_moe_triton import get_config
 
@@ -683,7 +687,7 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(E, N, dtype, block_n, block_k)
+        configs = get_moe_configs(E, N, dtype, block_n, block_k, file_path)
 
         if configs:
             # If an optimal configuration map has been found, look up the

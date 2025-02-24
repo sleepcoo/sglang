@@ -1,10 +1,16 @@
+import functools
 import logging
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    get_config_dtype_str,
+    get_default_config,
+    get_moe_configs,
+)
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -214,7 +220,6 @@ def compute_m_range(
     return m_range_start, m_range_end, expert_id
 
 
-@triton.jit
 def grouped_gemm_triton_kernel(
     a,
     b,
@@ -325,6 +330,44 @@ def compute_m_num_tiles_indptr(
         tl.store(m_num_tiles_indptr + bs + 1, pre_num_tiles + cur_num_tiles)
 
 
+def try_get_optimal_epmoe_config(
+    w_shape: Tuple[int, ...],
+    top_k: int,
+    dtype: Optional[str],
+    M: int,
+    is_marlin: bool = False,
+    block_shape: Optional[List[int]] = None,
+    file_path: Optional[str] = "",
+    is_w13: Optional[bool] = True,
+):
+    from sglang.srt.layers.moe.fused_moe_triton import get_config
+
+    if is_w13:
+        E, N, _ = w_shape
+    else:
+        E, _, N = w_shape
+    override_config = get_config()
+    if override_config:
+        config = override_config
+    else:
+        # First try to load optimal config from the file
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+        E, _, N = w_shape
+        configs = get_moe_configs(E, N, dtype, block_n, block_k, file_path)
+
+        if configs:
+            # If an optimal configuration map has been found, look up the
+            # optimal config
+            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        else:
+            # Else use the default config
+            config = get_default_config(
+                M, E, N, w_shape[2], top_k, dtype, is_marlin, block_shape
+            )
+    return config
+
+
 def grouped_gemm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -337,6 +380,7 @@ def grouped_gemm_triton(
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
+    is_w13: Optional[bool] = True,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
@@ -362,17 +406,29 @@ def grouped_gemm_triton(
         "BLOCK_SIZE_K": 128,
     }
 
+    config_dtype = get_config_dtype_str(
+        use_fp8_w8a8=use_fp8_w8a8,
+    )
+
+    CHUNK_SIZE = 64 * 1024
+    M = min(a.shape[0], CHUNK_SIZE)
+    get_config_func = functools.partial(
+        try_get_optimal_epmoe_config,
+        b.shape,
+        a.shape[0] / batch_size,
+        config_dtype,
+        block_shape=block_shape,
+        file_path=__file__,
+        is_w13=is_w13,
+    )
+    config = get_config_func(M)
+
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
 
-    grid = lambda META: (
-        triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
-        triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
-    )
-
-    grouped_gemm_triton_kernel[grid](
+    grouped_gemm_triton_kernel(
         a,
         b,
         c,
