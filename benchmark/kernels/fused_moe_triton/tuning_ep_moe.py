@@ -4,20 +4,17 @@ import json
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict, Optional, Callable
+import multiprocessing as mp
+
+mp.set_start_method("spawn", force=True)
 
 import torch
 import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe,
-    get_config_dtype_str,
-    get_config_file_name,
-    get_default_config,
-    get_moe_configs,
-)
-from sglang.srt.utils import is_hip, direct_register_custom_op
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
+from sglang.srt.utils import is_hip, direct_register_custom_op, get_device_name
 
 _is_hip_ = is_hip()
 
@@ -29,6 +26,21 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.moe.topk import select_experts
+
+def get_available_gpu_count():
+    """Get the number of available GPUs."""
+    return torch.cuda.device_count()
+
+def get_config_file_name(
+    E: int, N: int, ep_size: int, dtype: Optional[str], block_shape: Optional[int] = None
+) -> str:
+    device_name = get_device_name().replace(" ", "_")
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    )
+    ep_str = "" if ep_size == 0 else f"EP={ep_size}"
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{ep_str}.json"
 
 def ep_experts_fake(
     hidden_states: torch.Tensor,
@@ -292,7 +304,10 @@ def benchmark_config(
     use_int8_w8a16: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    ep_size: int = 4,
 ) -> float:
+    if block_shape is None:
+        block_shape = [config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]]
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16:
@@ -358,7 +373,6 @@ def benchmark_config(
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
-    ep_size = 4
     num_experts_per_partition = num_experts // ep_size
     cur_rank = torch.randint(0, ep_size - 1, (1,))[0]
     start_id = cur_rank * num_experts_per_partition
@@ -368,9 +382,7 @@ def benchmark_config(
         input_gating.copy_(gating_output[i])
 
     def run():
-        from sglang.srt.layers.moe.fused_moe_triton import override_config
-
-        with override_config(config):
+        with torch.inference_mode():
             ep_moe(
                 hidden_states=x,
                 w1=w1,
@@ -471,104 +483,52 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                 )
     return configs
 
+def tune(
+    gpu_id: int,
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,
+    topk: int,
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    block_shape: List[int],
+    search_space: List[Dict[str, int]],
+    ep_size: int,
+) -> Dict[str, int]:
+    torch.cuda.set_device(gpu_id)
+    print(f"Starting tuning on GPU {gpu_id} with batch sizes {num_tokens}")
 
-class BenchmarkWorker:
-
-    def __init__(self, seed: int) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
-        self.seed = seed
-
-    def benchmark(
-        self,
-        num_tokens: int,
-        num_experts: int,
-        shard_intermediate_size: int,
-        hidden_size: int,
-        topk: int,
-        dtype: torch.dtype,
-        use_fp8_w8a8: bool,
-        use_int8_w8a16: bool,
-        block_shape: List[int],
-    ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
-        dtype_str = get_config_dtype_str(
-            dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
-        )
-        # NOTE(woosuk): The current naming convention uses w2.shape[2], which
-        # is the intermediate size after silu_and_mul.
-        block_n = block_shape[0] if block_shape else 0
-        block_k = block_shape[1] if block_shape else 0
-        op_config = get_moe_configs(
-            num_experts, shard_intermediate_size // 2, dtype_str, block_n, block_k
-        )
-        if op_config is None:
-            config = get_default_config(
+    best_config = None
+    best_time = float("inf")
+    for config in tqdm(search_space):
+        try:
+            kernel_time = benchmark_config(
+                config,
                 num_tokens,
                 num_experts,
                 shard_intermediate_size,
                 hidden_size,
                 topk,
-                dtype_str,
-                False,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                block_shape,
+                num_iters=10,
+                ep_size=ep_size,
             )
-        else:
-            config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
-        kernel_time = benchmark_config(
-            config,
-            num_tokens,
-            num_experts,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a16,
-            block_shape,
-        )
-        return config, kernel_time
+        except triton.runtime.autotuner.OutOfResources:
+            # Some configurations may be invalid and fail to compile.
+            continue
 
-    def tune(
-        self,
-        num_tokens: int,
-        num_experts: int,
-        shard_intermediate_size: int,
-        hidden_size: int,
-        topk: int,
-        dtype: torch.dtype,
-        use_fp8_w8a8: bool,
-        use_int8_w8a16: bool,
-        block_shape: List[int],
-        search_space: List[Dict[str, int]],
-    ) -> Dict[str, int]:
-        best_config = None
-        best_time = float("inf")
-        for config in tqdm(search_space):
-            try:
-                kernel_time = benchmark_config(
-                    config,
-                    num_tokens,
-                    num_experts,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a16,
-                    block_shape,
-                    num_iters=10,
-                )
-            except triton.runtime.autotuner.OutOfResources:
-                # Some configurations may be invalid and fail to compile.
-                continue
-
-            if kernel_time < best_time:
-                best_time = kernel_time
-                best_config = config
-        now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
-        assert best_config is not None
-        return best_config
+        if kernel_time < best_time:
+            best_time = kernel_time
+            best_config = config
+    now = datetime.now()
+    print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+    assert best_config is not None
+    return best_config
 
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
@@ -682,85 +642,55 @@ def main(args: argparse.Namespace):
     else:
         batch_sizes = [args.batch_size]
 
-    workers = [BenchmarkWorker(args.seed)]
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method(*input_args)
-            outputs.append(output)
-        return outputs
+    num_gpus = get_available_gpu_count()
 
-    if args.tune:
-        search_space = get_configs_compute_bound()
-        if block_shape is not None:
-            block_n, block_k = block_shape[0], block_shape[1]
-            search_space = [
-                config
-                for config in search_space
-                if block_k % config["BLOCK_SIZE_K"] == 0
-            ]
-        print(f"Start tuning over {len(search_space)} configurations...")
+    search_space = get_configs_compute_bound()
+    if block_shape is not None:
+        block_n, block_k = block_shape[0], block_shape[1]
+        search_space = [
+            config
+            for config in search_space
+            if block_k % config["BLOCK_SIZE_K"] == 0
+        ]
+    print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
-        configs = _distribute(
-            "tune",
-            [
-                (
-                    batch_size,
-                    E,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a16,
-                    block_shape,
-                    search_space,
-                )
-                for batch_size in batch_sizes
-            ],
-        )
-        best_configs = {
-            M: sort_config(config) for M, config in zip(batch_sizes, configs)
-        }
-        save_configs(
-            best_configs,
-            E,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a16,
-            block_shape,
-        )
-        end = time.time()
-        print(f"Tuning took {end - start:.2f} seconds")
-    else:
-        outputs = _distribute(
-            "benchmark",
-            [
-                (
-                    batch_size,
-                    E,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a16,
-                    block_shape,
-                )
-                for batch_size in batch_sizes
-            ],
-        )
+    start = time.time()
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(num_gpus) as pool:
+        configs = pool.map(tune, [
+            (
+                i%num_gpus,
+                batch_size,
+                E,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                block_shape,
+                search_space,
+                args.ep_size,
+            )
+            for i, batch_size in enumerate(batch_sizes)
+        ])
 
-        for batch_size, (config, kernel_time) in zip(batch_sizes, outputs):
-            print(f"Batch size: {batch_size}, config: {config}")
-            print(f"Kernel time: {kernel_time:.2f} us")
+    best_configs = {
+        M: sort_config(config) for M, config in zip(batch_sizes, configs)
+    }
+    save_configs(
+        best_configs,
+        E,
+        shard_intermediate_size,
+        hidden_size,
+        topk,
+        dtype,
+        use_fp8_w8a8,
+        use_int8_w8a16,
+        block_shape,
+    )
+    end = time.time()
+    print(f"Tuning took {end - start:.2f} seconds")
 
 
 if __name__ == "__main__":
@@ -774,7 +704,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
-    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--ep-size", type=int, default=4)
     args = parser.parse_args()
 
     main(args)
