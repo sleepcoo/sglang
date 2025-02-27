@@ -42,28 +42,6 @@ def get_config_file_name(
     ep_str = "" if ep_size == 0 else f"EP={ep_size}"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{ep_str}.json"
 
-def ep_experts_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    top_k: int,
-    # from ep_moe
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    use_blockwise_fp8: bool = False,
-    # ep config
-    num_experts: int = 256,
-    # fp8_dtype: torch.types = torch.float8_e4m3fn,
-    num_experts_per_partition: int = 128,
-    start_expert_id: int = 0,
-    end_expert_id: int = 127,
-    use_fp8_w8a8: bool = False,
-    w1_scale_inv: Optional[torch.Tensor] = None,
-    w2_scale_inv: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
 def ep_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -219,13 +197,6 @@ def ep_experts(
     )
     return output
 
-direct_register_custom_op(
-    op_name="ep_experts",
-    op_func=ep_experts,
-    mutates_args=[],
-    fake_impl=ep_experts_fake,
-)
-
 def ep_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -261,7 +232,7 @@ def ep_moe(
         custom_routing_function=custom_routing_function,
     )
 
-    output = torch.ops.sglang.ep_experts(
+    output = ep_experts(
         hidden_states,
         w1,
         w2,
@@ -282,6 +253,56 @@ def ep_moe(
         block_shape,
     )
     return output
+
+def tune(
+    gpu_id: int,
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,
+    topk: int,
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    block_shape: List[int],
+    search_space: List[Dict[str, int]],
+    ep_size: int,
+) -> Dict[str, int]:
+    torch.cuda.set_device(gpu_id)
+    print(f"Starting tuning on GPU {gpu_id} with batch sizes {num_tokens}")
+
+    best_config = None
+    best_time = float("inf")
+    for config in tqdm(search_space):
+        try:
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                block_shape,
+                num_iters=10,
+                ep_size=ep_size,
+            )
+        except triton.runtime.autotuner.OutOfResources:
+            # Some configurations may be invalid and fail to compile.
+            continue
+
+        if kernel_time < best_time:
+            best_time = kernel_time
+            best_config = config
+    now = datetime.now()
+    print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+    assert best_config is not None
+    return best_config
+
+def _distribute(inputs):
+    return tune(*inputs)
 
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
@@ -306,6 +327,8 @@ def benchmark_config(
     num_iters: int = 100,
     ep_size: int = 4,
 ) -> float:
+    torch.set_default_device("cuda")
+    # print(f"default device in bs={num_tokens} is cuda:{torch.cuda.current_device()}")
     if block_shape is None:
         block_shape = [config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]]
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
@@ -374,7 +397,7 @@ def benchmark_config(
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
     num_experts_per_partition = num_experts // ep_size
-    cur_rank = torch.randint(0, ep_size - 1, (1,))[0]
+    cur_rank = torch.randint(0, ep_size - 1, (1,), dtype=torch.int32)[0].item()
     start_id = cur_rank * num_experts_per_partition
     end_id = start_id + num_experts_per_partition - 1
 
@@ -482,53 +505,6 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                     }
                                 )
     return configs
-
-def tune(
-    gpu_id: int,
-    num_tokens: int,
-    num_experts: int,
-    shard_intermediate_size: int,
-    hidden_size: int,
-    topk: int,
-    dtype: torch.dtype,
-    use_fp8_w8a8: bool,
-    use_int8_w8a16: bool,
-    block_shape: List[int],
-    search_space: List[Dict[str, int]],
-    ep_size: int,
-) -> Dict[str, int]:
-    torch.cuda.set_device(gpu_id)
-    print(f"Starting tuning on GPU {gpu_id} with batch sizes {num_tokens}")
-
-    best_config = None
-    best_time = float("inf")
-    for config in tqdm(search_space):
-        try:
-            kernel_time = benchmark_config(
-                config,
-                num_tokens,
-                num_experts,
-                shard_intermediate_size,
-                hidden_size,
-                topk,
-                dtype,
-                use_fp8_w8a8,
-                use_int8_w8a16,
-                block_shape,
-                num_iters=10,
-                ep_size=ep_size,
-            )
-        except triton.runtime.autotuner.OutOfResources:
-            # Some configurations may be invalid and fail to compile.
-            continue
-
-        if kernel_time < best_time:
-            best_time = kernel_time
-            best_config = config
-    now = datetime.now()
-    print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
-    assert best_config is not None
-    return best_config
 
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
@@ -654,12 +630,9 @@ def main(args: argparse.Namespace):
         ]
     print(f"Start tuning over {len(search_space)} configurations...")
 
-    start = time.time()
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(num_gpus) as pool:
-        configs = pool.map(tune, [
+    tune_args = [
             (
-                i%num_gpus,
+                i % num_gpus,
                 batch_size,
                 E,
                 shard_intermediate_size,
@@ -673,7 +646,12 @@ def main(args: argparse.Namespace):
                 args.ep_size,
             )
             for i, batch_size in enumerate(batch_sizes)
-        ])
+        ]
+
+    start = time.time()
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(num_gpus) as pool:
+        configs = pool.map(_distribute, tune_args)
 
     best_configs = {
         M: sort_config(config) for M, config in zip(batch_sizes, configs)
