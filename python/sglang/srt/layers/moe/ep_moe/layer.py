@@ -13,10 +13,19 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
+    pre_reorder_token_group_quant_fp8_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+if _is_cuda:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -221,19 +230,36 @@ class EPMoE(torch.nn.Module):
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
-        # PreReorder
-        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            self.w13_input_scale,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-        )
+        elif not self.activation_scheme == "dynamic" and not self.use_block_quant:
+            # PreReorder
+            pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+                hidden_states,
+                gateup_input,
+                src2dst,
+                topk_ids,
+                self.w13_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.top_k,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
+        elif self.activation_scheme == "dynamic" and self.use_block_quant:
+            pre_reorder_token_group_quant_fp8_triton_kernel(
+                a1_scales_ptr=self.w13_input_scale,
+                gateup_input_ptr=gateup_input,
+                input_ptr=hidden_states,
+                src2dst_ptr=src2dst,
+                topk_ids_ptr=topk_ids,
+                start_expert_id=self.start_expert_id,
+                end_expert_id=self.end_expert_id,
+                topk=self.top_k,
+                hidden_size=hidden_states.shape[1],
+                eps=1e-10,
+                fp8_max=224.0,
+                fp8_min=-224.0,
+                BLOCK_SIZE=128,
+            )
 
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
@@ -296,6 +322,12 @@ class EPMoE(torch.nn.Module):
                 self.end_expert_id,
                 BLOCK_SIZE=512,
             )
+            if self.activation_scheme == "dynamic" and self.use_block_quant:
+                block_n, block_k = self.block_shape[0], self.block_shape[1]
+                if _is_cuda:
+                    a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+                else:
+                    a, scale_a = per_token_group_quant_fp8(a, block_k)
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
 
