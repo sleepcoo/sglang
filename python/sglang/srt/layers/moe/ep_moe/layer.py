@@ -17,14 +17,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
+    silu_and_mul_token_group_quant_fp8_triton_kernel
 )
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
-if _is_cuda:
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
 
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
@@ -40,14 +34,19 @@ logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
-    flashinfer_gemm_warpper = None
+    sgl_kernel_gemm_wrapper = None
+    flashinfer_gemm_wrapper = None
 
-    def __init__(self, device, use_flashinfer: bool = False):
+    def __init__(self, device, use_flashinfer: bool = False, use_sgl_kernel: bool = False):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
+        self.use_sgl_kernel = use_sgl_kernel
+        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_wrapper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
+        elif self.use_sgl_kernel and GroupedGemmRunner.sgl_kernel_gemm_wrapper is None:
+            #TODO(yinfan98): add sgl_kernel (DeepEP)
+            sgl_kernel_gemm_wrapper = None
 
     @classmethod
     def _init_flashinfer_wrapper(cls, device):
@@ -85,6 +84,8 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
+        elif self.use_sgl_kernel:
+            assert False
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
@@ -101,7 +102,6 @@ class GroupedGemmRunner(torch.nn.Module):
                 block_shape=block_shape,
             )
         return c
-
 
 class EPMoE(torch.nn.Module):
     """
@@ -187,6 +187,57 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+    def get_w13_input_scale(self, hidden_states, activation_scheme, use_block_quant):
+        # case1: Do not quantize the model
+        input_scale = None
+        if not self.use_fp8_w8a8:
+            input_scale = None
+        elif self.use_fp8_w8a8:
+            if activation_scheme == "dynamic":
+                if not use_block_quant:
+                # case2: need no blockwise activation quant
+                    max_value = (
+                        torch.max(hidden_states)
+                        .repeat(self.num_experts_per_partition)
+                        .to(torch.float32)
+                    )
+                    input_scale = max_value / torch.finfo(self.fp8_dtype).max
+                elif use_block_quant:
+                # case3: need blockwise activation quant
+                    group_size = 128
+                    assert hidden_states.shape[-1] % group_size == 0
+                    input_scale = torch.empty(
+                        hidden_states.shape[:-1] + (hidden_states.shape[-1] // group_size,),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+        return input_scale
+    
+    def get_w2_input_scale(self, hidden_states, activation_scheme, use_block_quant):
+        # case1: Do not quantize the model
+        input_scale = None
+        if not self.use_fp8_w8a8:
+            input_scale = None
+        elif self.use_fp8_w8a8:
+            if activation_scheme == "dynamic":
+                if not use_block_quant:
+                # case2: need no blockwise activation quant
+                    input_scale = torch.ones(
+                        self.num_experts_per_partition,
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                elif use_block_quant:
+                # case3: need blockwise activation quant
+                    group_size = 128
+                    assert hidden_states.shape[-1] % group_size == 0
+                    input_scale = torch.empty(
+                        hidden_states.shape[:-1] + (hidden_states.shape[-1] // group_size,),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+        return input_scale
+    
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
         assert self.activation == "silu"
@@ -197,6 +248,7 @@ class EPMoE(torch.nn.Module):
                 use_flashinfer=False,  # TODO: use flashinfer
             )
 
+        # select expert
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -209,6 +261,7 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
+        # reorder token for group gemm
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
@@ -218,19 +271,17 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=(
                 self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                if self.use_fp8_w8a8
                 else hidden_states.dtype
             ),
         )
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            max_value = (
-                torch.max(hidden_states)
-                .repeat(self.num_experts_per_partition)
-                .to(torch.float32)
-            )
-            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
-        elif not self.activation_scheme == "dynamic" and not self.use_block_quant:
+        self.w13_input_scale = self.get_w13_input_scale(
+            hidden_states,
+            self.activation_scheme, 
+            self.use_block_quant)
+        # TODO(yinfan98): make pre_order to a function
+        if not self.use_block_quant:
             # PreReorder
             pre_reorder_triton_kernel[(hidden_states.shape[0],)](
                 hidden_states,
@@ -244,8 +295,9 @@ class EPMoE(torch.nn.Module):
                 hidden_states.shape[1],
                 BLOCK_SIZE=512,
             )
-        elif self.activation_scheme == "dynamic" and self.use_block_quant:
-            pre_reorder_token_group_quant_fp8_triton_kernel(
+        elif self.use_block_quant:
+            # FusedQuant PreReorder
+            pre_reorder_token_group_quant_fp8_triton_kernel[(hidden_states.shape[0],)](
                 a1_scales_ptr=self.w13_input_scale,
                 gateup_input_ptr=gateup_input,
                 input_ptr=hidden_states,
@@ -256,11 +308,12 @@ class EPMoE(torch.nn.Module):
                 topk=self.top_k,
                 hidden_size=hidden_states.shape[1],
                 eps=1e-10,
-                fp8_max=224.0,
-                fp8_min=-224.0,
-                BLOCK_SIZE=128,
+                fp8_max=torch.finfo(self.fp8_dtype).max,
+                fp8_min=torch.finfo(self.fp8_dtype).min,
+                BLOCK_SIZE=self.block_shape[0],
             )
 
+        # split expert to tokens
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
@@ -300,34 +353,42 @@ class EPMoE(torch.nn.Module):
             device=gateup_output.device,
             dtype=(
                 self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                if self.use_fp8_w8a8
                 else hidden_states.dtype
             ),
         )
-        if self.w2_input_scale is None and not self.use_block_quant:
-            self.w2_input_scale = torch.ones(
-                self.num_experts_per_partition,
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
+        if self.w2_input_scale is None:
+            self.w2_input_scale = self.get_w2_input_scale(
+                down_input,
+                self.activation_scheme, 
+                self.use_block_quant)
 
         if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                BLOCK_SIZE=512,
-            )
-            if self.activation_scheme == "dynamic" and self.use_block_quant:
-                block_n, block_k = self.block_shape[0], self.block_shape[1]
-                if _is_cuda:
-                    a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
-                else:
-                    a, scale_a = per_token_group_quant_fp8(a, block_k)
+            if not self.use_block_quant:
+                silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                    gateup_output,
+                    down_input,
+                    gateup_output.shape[1],
+                    reorder_topk_ids,
+                    self.w2_input_scale,
+                    self.start_expert_id,
+                    self.end_expert_id,
+                    BLOCK_SIZE=512,
+                )
+            elif self.use_block_quant:
+                silu_and_mul_token_group_quant_fp8_triton_kernel[(gateup_output.shape[0],)](
+                    gateup_output,
+                    down_input,
+                    gateup_output.shape[1],
+                    reorder_topk_ids,
+                    self.w2_input_scale,
+                    self.start_expert_id,
+                    self.end_expert_id,
+                    eps=1e-10,
+                    fp8_max=torch.finfo(self.fp8_dtype).max,
+                    fp8_min=torch.finfo(self.fp8_dtype).min,
+                    BLOCK_SIZE=self.block_shape[0]
+                )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
 

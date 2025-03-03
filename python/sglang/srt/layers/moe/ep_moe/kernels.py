@@ -14,52 +14,6 @@ if _is_cuda:
     )
 logger = logging.getLogger(__name__)
 
-
-@triton.jit
-def pre_reorder_token_group_quant_fp8_triton_kernel(
-    a1_scales_ptr,  # output fp32/fp16/bf16(b*s*topk, hidden/BLOCK_SIZE)
-    gateup_input_ptr,  # output fp8(b*s*topk, hidden)
-    input_ptr,  # input bf16/fp16(b*s, hidden)
-    src2dst_ptr,
-    topk_ids_ptr,
-    start_expert_id,
-    end_expert_id,
-    topk,
-    hidden_size,  # hidden_size must be divided by BLOCK_SIZE
-    eps,
-    fp8_max,
-    fp8_min,
-    BLOCK_SIZE: tl.constexpr,  # BLOCK_SIZE must be quant group size, that is 128
-):
-    OutDtype = gateup_input_ptr.dtype.element_ty
-    ScaleDtype = a1_scales_ptr.dtype.element_ty
-
-    src_idx = tl.program_id(0)
-    src2dst_ptr = src2dst_ptr + src_idx * topk
-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
-
-    src_ptr = input_ptr + src_idx * hidden_size
-    for idx in range(topk):
-        expert_id = tl.load(topk_ids_ptr + idx)
-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
-
-            dst_idx = tl.load(src2dst_ptr + idx)
-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
-            dst_scale_ptr = a1_scales_ptr + dst_idx * hidden_size // BLOCK_SIZE
-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
-                in_data = tl.load(src_ptr + offset).to(tl.float32)
-
-                _absmax = tl.maximum(tl.max(tl.abs(in_data)), eps)
-                out_scale = _absmax / fp8_max
-                out_data = tl.clamp(in_data / out_scale, fp8_min, fp8_max).to(OutDtype)
-
-                tl.store(
-                    dst_scale_ptr + start_offset // BLOCK_SIZE, out_scale.to(ScaleDtype)
-                )
-                tl.store(dst_ptr + offset, out_data)
-
-
 @triton.jit
 def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
     expert = tl.program_id(0)
@@ -142,6 +96,49 @@ def pre_reorder_triton_kernel(
                 out_data = (in_data * scale).to(OutDtype)
                 tl.store(dst_ptr + offset, out_data, mask=mask)
 
+@triton.jit
+def pre_reorder_token_group_quant_fp8_triton_kernel(
+    a1_scales_ptr,  # output fp32/fp16/bf16(b*s*topk, hidden/BLOCK_SIZE)
+    gateup_input_ptr,  # output fp8(b*s*topk, hidden)
+    input_ptr,  # input bf16/fp16(b*s, hidden)
+    src2dst_ptr,
+    topk_ids_ptr,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    hidden_size,  # hidden_size must be divided by BLOCK_SIZE
+    eps,
+    fp8_max,
+    fp8_min,
+    BLOCK_SIZE: tl.constexpr,  # BLOCK_SIZE must be quant group size, that is 128
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+    ScaleDtype = a1_scales_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            dst_scale_ptr = a1_scales_ptr + dst_idx * hidden_size // BLOCK_SIZE
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                in_data = tl.load(src_ptr + offset).to(tl.float32)
+
+                _absmax = tl.maximum(tl.max(tl.abs(in_data)), eps)
+                out_scale = _absmax / fp8_max
+                out_data = tl.clamp(in_data / out_scale, fp8_min, fp8_max).to(OutDtype)
+
+                tl.store(
+                    dst_scale_ptr + start_offset // BLOCK_SIZE, out_scale.to(ScaleDtype)
+                )
+                tl.store(dst_ptr + offset, out_data)
 
 @triton.jit
 def silu_and_mul_triton_kernel(
@@ -188,6 +185,51 @@ def silu_and_mul_triton_kernel(
             silu_mul_output = silu_mul_output.to(OutDtype)
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
+@triton.jit
+def silu_and_mul_token_group_quant_fp8_triton_kernel(
+    gateup_output, # output
+    down_input,
+    hidden_size, # hidden_size must be divided by BLOCK_SIZE*2
+    reorder_topk_ids,
+    scales, # output
+    start_expert_id,
+    end_expert_id,
+    eps,
+    fp8_max,
+    fp8_min,
+    BLOCK_SIZE: tl.constexpr, # BLOCK_SIZE must be quant group size, that is 128
+):
+    OutDtype = down_input.dtype.element_ty
+    ScaleDtype = scales.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+
+    pid = tl.program_id(0)
+    expert_id = tl.load(reorder_topk_ids + pid)
+    if expert_id >= start_expert_id and expert_id <= end_expert_id:
+        gateup_output_ptr = gateup_output + pid * hidden_size
+        gate_output_ptr = gateup_output_ptr
+        up_output_ptr = gateup_output_ptr + half_hidden_size
+        down_input_ptr = down_input + pid * half_hidden_size
+        scales_ptr = down_input + pid * half_hidden_size // BLOCK_SIZE
+
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < half_hidden_size
+
+            gate_output = tl.load(gate_output_ptr + offset, mask=mask).to(tl.float32)
+            up_output = tl.load(up_output_ptr + offset, mask=mask).to(tl.float32)
+
+            # silu & mul & quantize
+            gate_output = gate_output * tl.sigmoid(gate_output)
+
+            silu_mul_output = gate_output * up_output
+            _absmax = tl.maximum(tl.max(tl.abs(silu_mul_output)), eps)
+            out_scale =  fp8_max / _absmax
+            silu_mul_output = tl.clamp(silu_mul_output * out_scale, fp8_min, fp8_max).to(OutDtype)
+
+            tl.store(scales_ptr + offset // BLOCK_SIZE, out_scale)
+            tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
 @triton.jit
 def post_reorder_triton_kernel(
