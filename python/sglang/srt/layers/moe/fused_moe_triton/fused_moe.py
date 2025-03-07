@@ -378,7 +378,10 @@ def moe_align_block_size_triton(
 
 
 def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    local_experts: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -389,6 +392,8 @@ def moe_align_block_size(
         top-k expert indices for each token.
     - block_size: The block size used in block matrix multiplication.
     - num_experts: The total number of experts.
+    - local_experts: Optional list of expert indices available on the current device.
+        If provided, only tokens assigned to these experts will be processed.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -396,76 +401,92 @@ def moe_align_block_size(
     - expert_ids: A tensor indicating the assigned expert index for each block.
     - num_tokens_post_padded: The total number of tokens after padding,
         ensuring divisibility by block_size.
-
-    This function pads the number of tokens that each expert needs to process
-    so that it is divisible by block_size.
-    Padding ensures that during block matrix multiplication, the dimensions
-    align correctly.
-
-    Example:
-    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
-    block_size = 4, and num_experts = 4:
-    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
-        with each expert needing to process 3 tokens.
-    - As block_size is 4, we pad 1 token for each expert.
-    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
-    - Then append padding tokens [12, 12, 12, 12] for each block.
-    - After sorting by expert index, we obtain token_ids
-        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
-        Tokens 12 are non-existent (padding) and are ignored in
-        the subsequent matrix multiplication.
-    - The padding ensures that the total number of tokens is now divisible
-        by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
-    )
-    sorted_ids.fill_(topk_ids.numel())
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if num_experts >= 224:
-        if enable_moe_align_block_size_triton:
-            moe_align_block_size_triton(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-            )
-        else:
-            token_cnts_buffer = torch.zeros(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
+    device = topk_ids.device
+
+    # TODO Optimize the token rearrangement method of EP.
+    if local_experts is not None:
+        local_expert_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
+        local_expert_mask[torch.tensor(local_experts, device=device)] = True
+        token_mask = local_expert_mask[topk_ids]
+
+        valid_token_indices = torch.any(token_mask, dim=1).nonzero().squeeze(-1)
+        if valid_token_indices.numel() == 0:
+            empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
+            return (
+                empty_tensor,
+                empty_tensor,
+                torch.tensor([0], dtype=torch.int32, device=device),
             )
 
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                token_cnts_buffer,
-                cumsum_buffer,
-            )
+        filtered_topk_ids = topk_ids[valid_token_indices]
+        filtered_topk_ids = torch.where(
+            token_mask[valid_token_indices],
+            filtered_topk_ids,
+            torch.tensor(-1, device=device, dtype=topk_ids.dtype),
+        )
+
+        valid_expert_mask = filtered_topk_ids != -1
+        filtered_topk_ids = filtered_topk_ids[valid_expert_mask]
+
+        expert_mapping = torch.full(
+            (num_experts,), -1, dtype=torch.int32, device=device
+        )
+        for i, expert_id in enumerate(local_experts):
+            expert_mapping[expert_id] = i
+
+        process_topk_ids = expert_mapping[filtered_topk_ids]
+        actual_num_experts = len(local_experts)
     else:
-        ops.moe_align_block_size(
-            topk_ids,
-            num_experts,
+
+        process_topk_ids = topk_ids
+        actual_num_experts = num_experts
+
+    max_num_tokens_padded = process_topk_ids.numel() + actual_num_experts * (
+        block_size - 1
+    )
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
+    if not local_experts:
+        sorted_ids.fill_(topk_ids.numel())
+
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=device)
+
+    if enable_moe_align_block_size_triton:
+        moe_align_block_size_triton(
+            process_topk_ids,
+            actual_num_experts,
             block_size,
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
         )
+    else:
+        token_cnts_buffer = torch.zeros(
+            (actual_num_experts + 1) * actual_num_experts,
+            dtype=torch.int32,
+            device=device,
+        )
+        cumsum_buffer = torch.zeros(
+            actual_num_experts + 1, dtype=torch.int32, device=device
+        )
+
+        sgl_moe_align_block_size(
+            process_topk_ids,
+            actual_num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            token_cnts_buffer,
+            cumsum_buffer,
+        )
+
+    if local_experts is not None:
+        expert_ids_global = torch.tensor(local_experts, device=device)[expert_ids]
+        return sorted_ids, expert_ids_global, num_tokens_post_pad
+
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
