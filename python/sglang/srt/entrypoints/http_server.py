@@ -835,7 +835,7 @@ def _wait_and_warmup(
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    max_new_tokens = 883 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -860,7 +860,8 @@ def _wait_and_warmup(
             server_args.debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
-
+    json_data["text"] = json_data["text"] * 146 + " fuck the fuck the fuck"
+    print("ffffffddd ", json_data)
     try:
         if server_args.disaggregation_mode == "null":
             res = requests.post(
@@ -875,7 +876,7 @@ def _wait_and_warmup(
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
-                    "max_new_tokens": 8,
+                    "max_new_tokens": 883,
                     "ignore_eos": True,
                 },
                 "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,

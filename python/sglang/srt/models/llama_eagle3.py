@@ -89,20 +89,21 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
-
+        print("input_embeds ", embeds)
+        print("hidden_states ", hidden_states)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        print("after cat hidden :", hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
+        print("after attn norm :", hidden_states)
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-
+        print("after mlp :", hidden_states)
         return hidden_states, residual
 
 
@@ -149,11 +150,17 @@ class LlamaModel(nn.Module):
             embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
+        path = "/root/.cache/huggingface/hub/models--lukeysong--Llama-4-Scout-17B-16E-Eagle3/snapshots/fe6c99094bf16dcc74923b1d22084b6eac1303f3"
+        embeds = torch.load(path + "/input_embeds.pt").to(embeds.device)
+        embeds = embeds.view(-1, embeds.size(-1))
 
-        hidden_states = forward_batch.spec_info.hidden_states
+        # hidden_states = forward_batch.spec_info.hidden_states
+        hidden_states = torch.load(path + "/concatenated_features.pt").to(embeds.device)
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        print("aaaa", hidden_states.shape)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
-
+        print("ffff ", embeds.shape, hidden_states.shape, hidden_states)
         residual = None
         hidden_states, residual = self.midlayer(
             positions,
@@ -166,7 +173,7 @@ class LlamaModel(nn.Module):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
-
+        print("ffff ", hidden_states_to_logits)
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
 
