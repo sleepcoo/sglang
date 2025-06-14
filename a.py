@@ -4,6 +4,7 @@ path = "/root/.cache/huggingface/hub/models--lukeysong--Llama-4-Scout-17B-16E-Ea
 
 
 path = "/tmp/torchtune/llama4_17Bx16E/draft/input_embeds.pt"
+input_embeds_rms = torch.load(path)
 print("input fuck  ", input_embeds_rms.shape, input_embeds_rms)
 
 

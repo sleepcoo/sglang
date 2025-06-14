@@ -186,7 +186,9 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        print("q,k,v", q, q.shape, k, k.shape, v, v.shape)
         attn_output = self.attn(q, k, v, forward_batch)
+        print("attn without o ", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 

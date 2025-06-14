@@ -78,7 +78,6 @@ class RotaryEmbedding(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
         if not _is_cuda:
@@ -110,10 +109,11 @@ class RotaryEmbedding(CustomOp):
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
-
+        print("debug inv_freq:", inv_freq, self.max_position_embeddings)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
+        print("cos ", cos.shape, cos)
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
@@ -131,7 +131,6 @@ class RotaryEmbedding(CustomOp):
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
-
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
@@ -610,9 +609,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_native
+        self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -1106,6 +1103,19 @@ def get_rope(
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
+            print(
+                "debug rope ",
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            )
             rotary_emb = Llama3RotaryEmbedding(
                 head_size,
                 rotary_dim,

@@ -111,11 +111,10 @@ class RMSNorm(CustomOp):
         if residual is not None:
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
-        ccc = x
+
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
-        print(x, ccc, variance)
         if residual is None:
             return x
         else:

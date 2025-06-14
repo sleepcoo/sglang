@@ -69,13 +69,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
 
-        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=1e-5)
 
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
 
     def forward(
         self,
@@ -86,13 +84,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         print("input_embeds fuck", embeds.shape, embeds)
-        embeds1 = self.input_layernorm(embeds)
-        residual = hidden_states
-        print("input_embeds ", embeds.shape, embeds1)
+        embeds = self.input_layernorm(embeds)
+        print("input_embeds ", embeds.shape, embeds)
         hidden_states = self.hidden_norm(hidden_states)
+        residual = hidden_states
         print("hidden_states ", hidden_states.shape, hidden_states)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-        print("after cat hidden :", hidden_states.shape, hidden_states)
+        print("combined_input :", hidden_states.shape, hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
