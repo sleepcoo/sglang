@@ -154,7 +154,6 @@ class LlamaModel(nn.Module):
         path = "/root/.cache/huggingface/hub/models--lukeysong--Llama-4-Scout-17B-16E-Eagle3/snapshots/b1d8a533361fcf7cfef112fcea6be9113f18b071"
         embeds = torch.load(path + "/input_embeds.pt").to(embeds.device)
         embeds = embeds.view(-1, embeds.size(-1))
-        print("fffff ", embeds)
 
         # hidden_states = forward_batch.spec_info.hidden_states
         hidden_states = torch.load(path + "/concatenated_features.pt").to(embeds.device)
