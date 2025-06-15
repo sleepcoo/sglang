@@ -113,7 +113,8 @@ class RotaryEmbedding(CustomOp):
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        print("cos ", cos.shape, cos)
+        print("cos ", cos.shape, cos[:3])
+        print("sin ", sin.shape, sin[:3])
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 

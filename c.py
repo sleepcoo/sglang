@@ -1,11 +1,30 @@
 import torch
 
-path = "/root/.cache/huggingface/hub/models--lukeysong--Llama-4-Scout-17B-16E-Eagle3/snapshots/b1d8a533361fcf7cfef112fcea6be9113f18b071/"
 
-# torch.set_printoptions(threshold=float('inf'))
-input_embeds_rms = torch.load(path + "draft_outputs.pt")
-print("draft_outputs.pt ", input_embeds_rms.shape, input_embeds_rms)
+def apply_rotary_emb(x, cos, sin):
+    # x shape: [2, 4]
+    # Reshape to process pairs
+    x = x.view(2, 2, 2)
+    print(x)
+    print(x[:, :, 0], x[:, :, 1])
+    # Apply rotation to each pair
+    rx1 = x[:, :, 0] * cos - x[:, :, 1] * sin
+    rx2 = x[:, :, 0] * sin + x[:, :, 1] * cos
+
+    # Combine back
+    return torch.stack([rx1, rx2], dim=-1).view(2, 4)
 
 
-input_embeds_rms = torch.load(path + "attn_out.pt")
-print("attn_out.pt ", input_embeds_rms.shape, input_embeds_rms)
+# Input values
+q = torch.tensor([0.1602, 0.0684, 0.1172, -2.2656])
+cos = torch.tensor([0.5403, 0.6861])
+sin = torch.tensor([0.84147, 0.72746])
+
+# Reshape q to match the expected format (2 rows of 4 values)
+q = q.repeat(2, 1)  # Duplicate the row to get 2x4
+
+# Apply RoPE
+result = apply_rotary_emb(q, cos, sin)
+
+print("Original q:", q)
+print("Result after RoPE:", result)

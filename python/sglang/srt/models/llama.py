@@ -185,8 +185,9 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print("base q ", q, k)
         q, k = self.rotary_emb(positions, q, k)
-        print("q,k,v", q, q.shape, k, k.shape, v, v.shape)
+        print("q,k,v", q[1:2], q.shape, k[1:2], k.shape, v, v.shape)
         attn_output = self.attn(q, k, v, forward_batch)
         print("attn without o ", attn_output)
         output, _ = self.o_proj(attn_output)
