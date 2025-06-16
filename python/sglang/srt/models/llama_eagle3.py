@@ -98,7 +98,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             forward_batch=forward_batch,
         )
         print("attn out", hidden_states.shape, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states += residual
+        print("attn_out+residual:", hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states, None)
         print("after attn norm :", hidden_states.shape, hidden_states)
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
@@ -168,10 +170,9 @@ class LlamaModel(nn.Module):
             forward_batch,
             residual,
         )
-
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        print("residual ", residual)
+        hidden_states_to_logits = hidden_states + residual
+        hidden_states_to_aux = residual
         print("draft_outputs ", hidden_states_to_logits)
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
