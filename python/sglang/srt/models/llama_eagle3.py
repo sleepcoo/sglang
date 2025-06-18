@@ -100,6 +100,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
         print("attn out", hidden_states.shape, hidden_states)
         hidden_states += residual
+        print("residual ", residual)
         print(
             "attn_out+residual:",
             hidden_states,
