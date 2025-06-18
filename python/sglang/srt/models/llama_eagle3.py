@@ -177,7 +177,7 @@ class LlamaModel(nn.Module):
             forward_batch,
             residual,
         )
-
+        print("mlp out residual ", residual)
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
