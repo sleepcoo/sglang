@@ -100,7 +100,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
         print("attn out", hidden_states.shape, hidden_states)
         hidden_states += residual
-        print("attn_out+residual:", hidden_states)
+        print(
+            "attn_out+residual:",
+            hidden_states,
+            self.post_attention_layernorm.variance_epsilon,
+        )
         hidden_states = self.post_attention_layernorm(hidden_states, None)
         print("after attn norm :", hidden_states.shape, hidden_states)
         # Fully Connected
