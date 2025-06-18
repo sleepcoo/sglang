@@ -83,12 +83,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_states
         embeds = self.input_layernorm(embeds)
         print(
             "input_embeds ", embeds.shape, embeds, self.input_layernorm.variance_epsilon
         )
         hidden_states = self.hidden_norm(hidden_states)
-        residual = hidden_states
         print("hidden_states ", hidden_states.shape, hidden_states)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         print("combined_input :", hidden_states.shape, hidden_states)
