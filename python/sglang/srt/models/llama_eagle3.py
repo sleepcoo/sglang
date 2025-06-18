@@ -172,9 +172,10 @@ class LlamaModel(nn.Module):
             forward_batch,
             residual,
         )
-        print("residual ", residual)
-        hidden_states_to_logits = hidden_states + residual
-        hidden_states_to_aux = residual
+
+        hidden_states_to_logits, hidden_states_to_aux = self.norm(
+            hidden_states, residual
+        )
         print("draft_outputs ", hidden_states_to_logits)
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
