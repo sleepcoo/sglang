@@ -860,7 +860,9 @@ def _wait_and_warmup(
             server_args.debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
-    json_data["text"] = json_data["text"] * 105 + " fuck the fuck the fuck fuck"
+    json_data["text"] = (
+        json_data["text"] * 105 + " fuck the fuck the fuck fuck fuck fuck"
+    )
     print("ffffffddd ", json_data)
     try:
         if server_args.disaggregation_mode == "null":
