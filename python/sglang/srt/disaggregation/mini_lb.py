@@ -49,10 +49,16 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+    def __init__(
+        self,
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+        fast_first_token: bool,
+    ):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.fast_first_token = fast_first_token
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -158,6 +164,12 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
+                    if self.fast_first_token:
+                        async for chunk in prefill_response.content.iter_chunked(
+                            AIOHTTP_STREAM_READ_CHUNK_SIZE
+                        ):
+                            chunk = chunk.replace(b"data: [DONE]\n\n", b"")
+                            yield chunk
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
@@ -400,9 +412,9 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(prefill_configs, decode_addrs, host, port, fast_first_token):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs, fast_first_token)
     uvicorn.run(app, host=host, port=port)
 
 

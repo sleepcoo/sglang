@@ -425,7 +425,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.server_args.fast_first_token and not getattr(
                     req, "prefill_token_streamed", False
                 ):
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                    req.send_decode_id_offset = 1
                     self.stream_output([req], req.return_logprob)
+                    req.prefill_token_streamed = True
+
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
@@ -510,7 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
                 assert False, f"Unexpected polling state {poll=}"
 
         # Stream requests which have finished transfer
-        if self.server_args.fast_first_token:
+        if not self.server_args.fast_first_token:
             self.stream_output(
                 done_reqs,
                 any(req.return_logprob for req in done_reqs),

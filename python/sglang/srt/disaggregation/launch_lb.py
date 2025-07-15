@@ -12,6 +12,7 @@ class LBArgs:
     decode_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
+    fast_first_token: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -71,6 +72,11 @@ class LBArgs:
             default=LBArgs.timeout,
             help=f"Timeout in seconds (default: {LBArgs.timeout})",
         )
+        parser.add_argument(
+            "--fast-first-token",
+            action="store_ture",
+            help="Enable fast streaming of the first token in prefill stage.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "LBArgs":
@@ -98,6 +104,7 @@ class LBArgs:
             decode_infos=args.decode,
             log_interval=args.log_interval,
             timeout=args.timeout,
+            fast_first_token=args.fast_first_token,
         )
 
     def __post_init__(self):
@@ -133,7 +140,13 @@ def main():
         prefill_configs = [
             PrefillConfig(url, port) for url, port in lb_args.prefill_infos
         ]
-        run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+        run(
+            prefill_configs,
+            lb_args.decode_infos,
+            lb_args.host,
+            lb_args.port,
+            lb_args.fast_first_token,
+        )
 
 
 if __name__ == "__main__":
