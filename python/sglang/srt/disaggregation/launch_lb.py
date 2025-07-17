@@ -74,7 +74,7 @@ class LBArgs:
         )
         parser.add_argument(
             "--fast-first-token",
-            action="store_ture",
+            action="store_true",
             help="Enable fast streaming of the first token in prefill stage.",
         )
 
